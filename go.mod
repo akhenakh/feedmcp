@@ -1,4 +1,4 @@
-module github.com/akhenakh/mcpfeed
+module github.com/akhenakh/feedmcp
 
 go 1.26.1
 
