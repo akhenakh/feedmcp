@@ -16,4 +16,5 @@
 # vendor/
 docs/*.md
 docs.sqlite
+feedmcp
 
