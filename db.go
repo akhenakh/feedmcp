@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"database/sql"
 	"fmt"
+	"sort"
 	"strings"
 
 	_ "github.com/mattn/go-sqlite3"
@@ -82,30 +83,28 @@ func saveChunk(tx *sql.Tx, dataset, filepath string, seq int, content string) er
 type SearchResult struct {
 	Dataset  string
 	Filepath string
-	Seq      int
-	Snippet  string
+	StartSeq int
+	EndSeq   int
+	Content  string
 }
 
 func searchDocs(db *sql.DB, query string, dataset string, limit int) ([]SearchResult, error) {
 	// Escape single quotes
 	query = strings.ReplaceAll(query, "'", "''")
 
-	// If a dataset is provided, filter using the document_chunks (aliased as 'c') dataset column
 	datasetFilter := ""
 	if dataset != "" {
-		// FIX: Use c.dataset to resolve the ambiguity
 		datasetFilter = fmt.Sprintf(" AND c.dataset = '%s'", dataset)
 	}
 
-	// Weighted query: filepath (10), headers (5), content (1)
+	// 1. Initial High-Precision BM25 Retrieval
+	// (Weighted query: filepath 10.0, headers 5.0, content 1.0)
 	q := fmt.Sprintf(`
-		SELECT 
-			c.dataset, c.filepath, c.seq, 
-			snippet(search_idx, 3, '>>', '<<', '...', 30) 
+		SELECT c.dataset, c.filepath, c.seq
 		FROM search_idx s
 		JOIN document_chunks c ON s.rowid = c.id
 		WHERE search_idx MATCH '%s'%s
-		ORDER BY bm25(search_idx, 10.0, 5.0, 1.0) 
+		ORDER BY bm25(search_idx, 10.0, 5.0, 1.0) ASC
 		LIMIT %d;
 	`, query, datasetFilter, limit)
 
@@ -115,13 +114,92 @@ func searchDocs(db *sql.DB, query string, dataset string, limit int) ([]SearchRe
 	}
 	defer rows.Close()
 
-	var results []SearchResult
+	// 2. Group matches by dataset+filepath to preserve context ordering
+	type fileKey struct{ dataset, filepath string }
+	var orderedKeys []fileKey
+	hits := make(map[fileKey][]int)
+
 	for rows.Next() {
-		var r SearchResult
-		if err := rows.Scan(&r.Dataset, &r.Filepath, &r.Seq, &r.Snippet); err == nil {
-			// Clean snippet newlines for cleaner output
-			r.Snippet = strings.ReplaceAll(r.Snippet, "\n", " ")
-			results = append(results, r)
+		var ds, fp string
+		var seq int
+		if err := rows.Scan(&ds, &fp, &seq); err == nil {
+			k := fileKey{ds, fp}
+			if _, exists := hits[k]; !exists {
+				orderedKeys = append(orderedKeys, k) // Persist relevance order
+			}
+			hits[k] = append(hits[k], seq)
+		}
+	}
+
+	// 3. Relevant Segment Extraction (RSE)
+	var results []SearchResult
+
+	for _, key := range orderedKeys {
+		seqs := hits[key]
+		sort.Ints(seqs) // Ensure sequential order
+
+		type span struct{ start, end int }
+		var spans []span
+
+		for _, s := range seqs {
+			// REMOVED aggressive context enrichment (s-1, s+1) to keep payload sizes lean
+			start := s
+			end := s
+
+			// Merge contiguous/overlapping chunks logically
+			if len(spans) == 0 {
+				spans = append(spans, span{start, end})
+			} else {
+				last := &spans[len(spans)-1]
+				if start <= last.end+1 {
+					if end > last.end {
+						last.end = end
+					}
+				} else {
+					spans = append(spans, span{start, end})
+				}
+			}
+		}
+
+		// 4. Fetch the continuous text segments from the DB
+		for _, sp := range spans {
+			fetchQ := `
+				SELECT seq, content 
+				FROM document_chunks 
+				WHERE dataset = ? AND filepath = ? AND seq >= ? AND seq <= ?
+				ORDER BY seq ASC
+			`
+			spanRows, err := db.Query(fetchQ, key.dataset, key.filepath, sp.start, sp.end)
+			if err != nil {
+				continue
+			}
+
+			var sb strings.Builder
+			actualStart, actualEnd := -1, -1
+
+			for spanRows.Next() {
+				var sq int
+				var cnt string
+				if err := spanRows.Scan(&sq, &cnt); err == nil {
+					if actualStart == -1 {
+						actualStart = sq
+					}
+					actualEnd = sq
+					sb.WriteString(cnt)
+					sb.WriteString("\n")
+				}
+			}
+			spanRows.Close()
+
+			if actualStart != -1 {
+				results = append(results, SearchResult{
+					Dataset:  key.dataset,
+					Filepath: key.filepath,
+					StartSeq: actualStart,
+					EndSeq:   actualEnd,
+					Content:  sb.String(),
+				})
+			}
 		}
 	}
 	return results, nil
